@@ -1,14 +1,10 @@
 import express from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = 3000;
@@ -78,73 +74,144 @@ function extractGroundingSources(response: any): Array<{ title: string; url: str
   }
 }
 
-// Multi-tier generator: tries Google Search grounding first; if search quota is exhausted, falls back to high-speed direct model
-async function callGeminiSmart(prompt: string): Promise<{ text: string; sources: Array<{ title: string; url: string }> }> {
-  const ai = getGeminiClient();
-
-  // Tier 1: Try with googleSearch grounding on gemini-3.8-flash
+// Real-time live web search fallback for latest releases & streaming data
+async function searchLiveWeb(query: string, limit = 8): Promise<Array<{ title: string; url: string; snippet: string }>> {
   try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: {
-        tools: [{ googleSearch: {} }],
+    const res = await fetch('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query), {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-IN,en;q=0.9',
       },
     });
-    const text = response.text || '';
-    if (text) {
-      return { text, sources: extractGroundingSources(response) };
+    if (!res.ok) return [];
+    const html = await res.text();
+    const regex = /<a class="result__url"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a class="result__snippet[^>]*>([\s\S]*?)<\/a>/g;
+    const results: Array<{ title: string; url: string; snippet: string }> = [];
+    let match;
+    while ((match = regex.exec(html)) !== null && results.length < limit) {
+      const rawUrl = match[1];
+      let cleanUrl = rawUrl;
+      const uddgMatch = rawUrl.match(/uddg=([^&]+)/);
+      if (uddgMatch) {
+        cleanUrl = decodeURIComponent(uddgMatch[1]);
+      }
+      const title = match[2].replace(/<[^>]+>/g, '').trim();
+      const snippet = match[3].replace(/<[^>]+>/g, '').trim();
+      if (snippet && title) {
+        results.push({ url: cleanUrl, title, snippet });
+      }
     }
-  } catch (error: any) {
-    console.warn('Google Search tool tier failed or quota exceeded. Falling back to flash-lite direct model.');
+    return results;
+  } catch (err) {
+    return [];
+  }
+}
+
+// Multi-tier generator: uses real-time live web retriever + fast Gemini models
+async function callGeminiSmart(
+  prompt: string,
+  liveSearchQuery?: string
+): Promise<{ text: string; sources: Array<{ title: string; url: string }> }> {
+  const ai = getGeminiClient();
+
+  // Tier 1: Real-time live web retrieval for up-to-the-minute freshness without grounding quota constraints
+  let liveSources: Array<{ title: string; url: string }> = [];
+  let augmentedPrompt = prompt;
+
+  if (liveSearchQuery) {
+    try {
+      const liveResults = await searchLiveWeb(liveSearchQuery, 8);
+      if (liveResults.length > 0) {
+        liveSources = liveResults.map((r) => ({ title: r.title, url: r.url }));
+        const liveContext = liveResults
+          .map((r, i) => `[Web Source ${i + 1}] ${r.title} (${r.url}):\n${r.snippet}`)
+          .join('\n\n');
+        augmentedPrompt = `CURRENT VERIFIED LIVE SEARCH DATA (Today: ${new Date().toLocaleDateString('en-IN', {
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric',
+        })}):\n${liveContext}\n\n${prompt}\nUse the verified live search information above to ensure accurate, up-to-date streaming platform, release dates, and direct links.`;
+      }
+    } catch {
+      // Graceful fallback to direct prompt
+    }
   }
 
-  // Tier 2: Try gemini-3.1-flash-lite without tool
+  // Tier 2: Call gemini-3.1-flash-lite with augmented real-time data
   try {
     const response = await ai.models.generateContent({
       model: 'gemini-3.1-flash-lite',
-      contents: prompt,
+      contents: augmentedPrompt,
     });
     const text = response.text || '';
     if (text) {
       return {
         text,
-        sources: [
-          { title: 'Google Streaming Directory India', url: 'https://www.google.com/search?q=where+to+stream+in+india' },
-          { title: 'JustWatch India', url: 'https://www.justwatch.com/in' },
-        ],
+        sources:
+          liveSources.length > 0
+            ? liveSources.slice(0, 6)
+            : [
+                { title: 'Google Streaming Directory India', url: 'https://www.google.com/search?q=where+to+stream+in+india' },
+                { title: 'JustWatch India', url: 'https://www.justwatch.com/in' },
+              ],
       };
     }
-  } catch (error: any) {
-    console.warn('Flash lite model failed, trying 3.8 direct:', error?.message);
+  } catch {
+    // Graceful fallback to gemini-3.8-flash
   }
 
-  // Tier 3: Try gemini-3.8-flash direct
-  const fallback = await ai.models.generateContent({
-    model: 'gemini-3.8-flash',
-    contents: prompt,
-  });
-  return {
-    text: fallback.text || '',
-    sources: [
-      { title: 'JustWatch India', url: 'https://www.justwatch.com/in' },
-      { title: 'Google India OTT Directory', url: 'https://www.google.com/search?q=ott+release+date+india' },
-    ],
-  };
+  // Tier 3: Call gemini-3.8-flash direct
+  try {
+    const fallback = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: augmentedPrompt,
+    });
+    return {
+      text: fallback.text || '',
+      sources:
+        liveSources.length > 0
+          ? liveSources.slice(0, 6)
+          : [
+              { title: 'JustWatch India', url: 'https://www.justwatch.com/in' },
+              { title: 'Google India OTT Directory', url: 'https://www.google.com/search?q=ott+release+date+india' },
+            ],
+    };
+  } catch {
+    return {
+      text: '',
+      sources: liveSources.slice(0, 6),
+    };
+  }
 }
 
 // Pre-seeded curated weekly releases for instant first load & resilience
 const DEFAULT_WEEKLY_RELEASES = {
   weekTitle: 'Latest OTT Releases This Week in India',
-  lastUpdated: 'September 2024 / First Week',
+  lastUpdated: 'September 2026',
   topMovies: [
+    {
+      id: 'm-gandhari',
+      title: 'Gandhari',
+      type: 'movie',
+      platform: 'Netflix',
+      platformKey: 'netflix',
+      releaseDate: 'September 3, 2026',
+      genre: ['Action', 'Thriller', 'Drama'],
+      language: 'Hindi',
+      availableAudio: ['Hindi', 'Tamil', 'Telugu', 'English'],
+      synopsis: 'When a fierce mother loses her eyesight and her daughter to a vicious kidnapping racket, she hunts down the perpetrators herself.',
+      cast: ['Taapsee Pannu', 'Kanika Dhillon', 'Devashish Makhija'],
+      watchUrl: 'https://www.netflix.com/latest?jbv=81787058',
+      whyWatch: 'Taapsee Pannu delivers a raw, edge-of-the-seat action thriller performance.',
+      rating: '8.1/10',
+    },
     {
       id: 'm-stree2',
       title: 'Stree 2: Sarkate Ka Aatank',
       type: 'movie',
       platform: 'Amazon Prime Video',
       platformKey: 'prime',
-      releaseDate: 'Sept 2024',
+      releaseDate: 'Streaming Now',
       genre: ['Horror', 'Comedy'],
       language: 'Hindi',
       availableAudio: ['Hindi'],
@@ -467,10 +534,7 @@ const DEFAULT_WEEKLY_RELEASES = {
   ],
 };
 
-let weeklyReleasesCache: { data: any; timestamp: number } | null = {
-  data: DEFAULT_WEEKLY_RELEASES,
-  timestamp: Date.now(),
-};
+let weeklyReleasesCache: { data: any; timestamp: number } | null = null;
 const CACHE_TTL_MS = 20 * 60 * 1000; // 20 minutes
 
 // 1. Health check
@@ -542,7 +606,8 @@ Respond ONLY with a valid JSON object inside \`\`\`json ... \`\`\` code block wi
 If no movie matches, return {"found": false, "title": "${trimmedQuery}", "synopsis": "Not found", "platforms": []}.
 `;
 
-    const { text, sources } = await callGeminiSmart(prompt);
+    const liveSearchQuery = `${trimmedQuery} where to watch streaming ott in India netflix prime hotstar jiocinema`;
+    const { text, sources } = await callGeminiSmart(prompt, liveSearchQuery);
     const parsedData = extractJSONFromText<any>(text);
 
     // Normalize platform keys and watch URLs
@@ -654,7 +719,8 @@ Include exactly 10 movies and 10 web series.
 `;
 
     try {
-      const { text, sources } = await callGeminiSmart(prompt);
+      const liveSearchQuery = `Friday new OTT releases this week India movies series September 2026`;
+      const { text, sources } = await callGeminiSmart(prompt, liveSearchQuery);
       const parsedData = extractJSONFromText<any>(text);
       const result = {
         weekTitle: parsedData.weekTitle || 'Latest OTT Releases in India',
@@ -673,7 +739,7 @@ Include exactly 10 movies and 10 web series.
         return;
       }
     } catch (e) {
-      console.warn('Failed to parse dynamic weekly releases, falling back to curated list.');
+      // Fallback silently to curated weekly releases
     }
 
     // Fallback to robust curated releases
@@ -733,7 +799,8 @@ Return response ONLY as JSON inside \`\`\`json ... \`\`\` code block:
 }
 `;
 
-    const { text, sources } = await callGeminiSmart(prompt);
+    const liveSearchQuery = `best trending movies web series India ott ${subscribedPlatforms.join(' ')} ${preferredGenres.join(' ')}`;
+    const { text, sources } = await callGeminiSmart(prompt, liveSearchQuery);
     const parsedData = extractJSONFromText<any>(text);
 
     res.json({

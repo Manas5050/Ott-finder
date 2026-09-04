@@ -2,5 +2,7 @@
   "name": "OTT StreamFinder India",
   "description": "Real-time OTT streaming finder for movies and series in India with live platform availability, direct watch links, weekly releases, and personalized recommendations.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
